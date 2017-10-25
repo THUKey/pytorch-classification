@@ -20,8 +20,10 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import models.cifar as models
 
+from collections import OrderedDict
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
-
+#from utee import misc, quant, selector
+from utee import quant
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -76,6 +78,13 @@ parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
 #Device options
 parser.add_argument('--gpu_id', default='1', type=str,
                     help='id(s) for CUDA_VISIBLE_DEVICES')
+
+# for quantization
+parser.add_argument('--quant_method', default='', help='linear|minmax|log|tanh')
+parser.add_argument('--param_bits', type=int, default=8, help='bit-width for parameters')
+parser.add_argument('--bn_bits', type=int, default=32, help='bit-width for running mean and std')
+parser.add_argument('--fwd_bits', type=int, default=8, help='bit-width for layer output')
+parser.add_argument('--overflow_rate', type=float, default=0.0, help='overflow rate')
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -190,7 +199,34 @@ def main():
         logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
         logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
 
-
+    if args.quant_method:
+        if args.param_bits < 32:
+            state_dict = model.state_dict()
+            state_dict_quant = OrderedDict()
+            sf_dict = OrderedDict()
+            for k, v in state_dict.items():
+                if 'running' in k:
+                    if args.bn_bits >=32:
+                        print("Ignoring {}".format(k))
+                        state_dict_quant[k] = v
+                        continue
+                    else:
+                        bits = args.bn_bits
+                else:
+                    bits = args.param_bits
+                if args.quant_method == 'linear':
+                    sf = bits - 1. - quant.compute_integral_part(v, overflow_rate=args.overflow_rate)
+                    v_quant  = quant.linear_quantize(v, sf, bits=bits)
+                elif args.quant_method == 'log':
+                    v_quant = quant.log_minmax_quantize(v, bits=bits)
+                elif args.quant_method == 'minmax':
+                    v_quant = quant.min_max_quantize(v, bits=bits)
+                else:
+                    v_quant = quant.tanh_quantize(v, bits=bits)
+                state_dict_quant[k] = v_quant
+                print(k, bits)
+            model.load_state_dict(state_dict_quant)
+        print('model quanted')
     if args.evaluate:
         print('\nEvaluation only')
         test_loss, test_acc = test(testloader, model, criterion, start_epoch, use_cuda)
