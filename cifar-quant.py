@@ -22,7 +22,7 @@ import models.cifar as models
 
 from collections import OrderedDict
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
-#from utee import misc, quant, selector
+from utils import Logboard
 from utee import quant
 
 model_names = sorted(name for name in models.__dict__
@@ -85,6 +85,8 @@ parser.add_argument('--param_bits', type=int, default=8, help='bit-width for par
 parser.add_argument('--bn_bits', type=int, default=32, help='bit-width for running mean and std')
 parser.add_argument('--fwd_bits', type=int, default=8, help='bit-width for layer output')
 parser.add_argument('--overflow_rate', type=float, default=0.0, help='overflow rate')
+parser.add_argument('--n_sample', type=int, default=20, help='number of samples to infer the scaling factor')
+parser.add_argument('--quant_density', type=int, default=20, help='quant density when train')
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -105,6 +107,14 @@ if use_cuda:
     torch.cuda.manual_seed_all(args.manualSeed)
 
 best_acc = 0  # best test accuracy
+
+def to_np(x):
+    return x.data.cpu().numpy()
+
+def to_var(x):
+    if torch.cuda.is_available():
+        x = x.cuda()
+    return Variable(x)    
 
 def main():
     global best_acc
@@ -194,39 +204,20 @@ def main():
         start_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer'])
+        #reset the learning rate
+        reset_learning_rate(optimizer)
         logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title, resume=True)
+        logboard = Logboard(os.path.join(args.checkpoint, 'logs'))
     else:
         logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
         logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
+        logboard = Logboard(os.path.join(args.checkpoint, 'logs'))
 
     if args.quant_method:
-        if args.param_bits < 32:
-            state_dict = model.state_dict()
-            state_dict_quant = OrderedDict()
-            sf_dict = OrderedDict()
-            for k, v in state_dict.items():
-                if 'running' in k:
-                    if args.bn_bits >=32:
-                        print("Ignoring {}".format(k))
-                        state_dict_quant[k] = v
-                        continue
-                    else:
-                        bits = args.bn_bits
-                else:
-                    bits = args.param_bits
-                if args.quant_method == 'linear':
-                    sf = bits - 1. - quant.compute_integral_part(v, overflow_rate=args.overflow_rate)
-                    v_quant  = quant.linear_quantize(v, sf, bits=bits)
-                elif args.quant_method == 'log':
-                    v_quant = quant.log_minmax_quantize(v, bits=bits)
-                elif args.quant_method == 'minmax':
-                    v_quant = quant.min_max_quantize(v, bits=bits)
-                else:
-                    v_quant = quant.tanh_quantize(v, bits=bits)
-                state_dict_quant[k] = v_quant
-                print(k, bits)
-            model.load_state_dict(state_dict_quant)
-        print('model quanted')
+        quant_weight(model)
+        model = quant.duplicate_model_with_quant(model, bits=args.fwd_bits, overflow_rate=args.overflow_rate, counter=args.n_sample, type=args.quant_method)
+        print('activation quanted')
+
     if args.evaluate:
         print('\nEvaluation only')
         test_loss, test_acc = test(testloader, model, criterion, start_epoch, use_cuda)
@@ -255,6 +246,31 @@ def main():
                 'best_acc': best_acc,
                 'optimizer' : optimizer.state_dict(),
             }, is_best, checkpoint=args.checkpoint)
+        #============ TensorBoard logging ============#
+        # (1) Log the scalar values
+        info = {
+            'train_loss': train_loss,
+            'train_accuracy': train_acc,
+            'test_loss': test_loss,
+            'test_accuracy': test_acc
+        }
+
+        for tag, value in info.items():
+            logboard.scalar_summary(tag, value, epoch+1)
+
+        # (2) Log values and gradients of the parameters (histogram)
+        for tag, value in model.named_parameters():
+            tag = tag.replace('.', '/')
+            logboard.histo_summary(tag, to_np(value), epoch+1)
+            logboard.histo_summary(tag+'/grad', to_np(value.grad), epoch+1)
+
+        # (3) Log the images
+       # info = {
+       #     'images': to_np(images.view(-1, 28, 28)[:10])
+       # }
+
+       # for tag, images in info.items():
+       #     logboard.image_summary(tag, images, step+1)
 
     logger.close()
     logger.plot()
@@ -282,6 +298,9 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda(async=True)
         inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
+
+        #if args.quant_method and batch_idx%args.quant_density == 0:
+        #    quant_weight(model)
 
         # compute output
         outputs = model(inputs)
@@ -382,6 +401,44 @@ def adjust_learning_rate(optimizer, epoch):
         state['lr'] *= args.gamma
         for param_group in optimizer.param_groups:
             param_group['lr'] = state['lr']
+
+def reset_learning_rate(optimizer):
+    global state
+    state['lr'] = args.lr
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = state['lr']
+
+def quant_weight(model):
+    if args.quant_method:
+        if args.param_bits < 32:
+            state_dict = model.state_dict()
+            state_dict_quant = OrderedDict()
+            sf_dict = OrderedDict()
+            for k, v in state_dict.items():
+                if 'running' in k:
+                    if args.bn_bits >=32:
+                       #print("Ignoring {}".format(k))
+                        state_dict_quant[k] = v
+                        continue
+                    else:
+                        bits = args.bn_bits
+                else:
+                    bits = args.param_bits
+                if args.quant_method == 'linear':
+                    sf = bits - 1. - quant.compute_integral_part(v, overflow_rate=args.overflow_rate)
+                    v_quant  = quant.linear_quantize(v, sf, bits=bits)
+                elif args.quant_method == 'log':
+                    v_quant = quant.log_minmax_quantize(v, bits=bits)
+                elif args.quant_method == 'minmax':
+                    v_quant = quant.min_max_quantize(v, bits=bits)
+                else:
+                    v_quant = quant.tanh_quantize(v, bits=bits)
+                state_dict_quant[k] = v_quant
+               # print(k, bits)
+            model.load_state_dict(state_dict_quant)
+            print('model quanted')
+            return model
+
 
 if __name__ == '__main__':
     main()
