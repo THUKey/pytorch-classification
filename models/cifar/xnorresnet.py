@@ -11,6 +11,8 @@ import torch.nn as nn
 import math
 import torch
 import torch.nn.functional as F
+import torch.nn.init as init
+import numpy as np
 
 
 __all__ = ['xnorresnet']
@@ -49,6 +51,8 @@ class BinConv2d(nn.Module):
             self.dropout = nn.Dropout(dropout)
         self.conv = nn.Conv2d(input_channels, output_channels,
                 kernel_size=kernel_size, stride=stride, padding=padding, bias=False)
+        #init.xavier_uniform(self.conv.weight)
+        init.xavier_uniform(self.conv.weight, gain=np.sqrt(2))
         self.relu = nn.ReLU(inplace=True)
     
     def forward(self, x):
@@ -63,8 +67,8 @@ class BinConv2d(nn.Module):
 class BinConv2d_norelu(nn.Module):
     def __init__(self, input_channels, output_channels,
             kernel_size=-1, stride=-1, padding=-1, dropout=0):
-        super(BinConv2d, self).__init__()
-        self.layer_type = 'BinConv2d'
+        super(BinConv2d_norelu, self).__init__()
+        self.layer_type = 'BinConv2d_norelu'
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
@@ -75,6 +79,8 @@ class BinConv2d_norelu(nn.Module):
             self.dropout = nn.Dropout(dropout)
         self.conv = nn.Conv2d(input_channels, output_channels,
                 kernel_size=kernel_size, stride=stride, padding=padding, bias=False)
+        #init.xavier_uniform(self.conv.weight)
+        init.xavier_uniform(self.conv.weight, gain=np.sqrt(2))
         #self.relu = nn.ReLU(inplace=True)
     
     def forward(self, x):
@@ -107,10 +113,11 @@ class BinBasicBlock(nn.Module):
     def __init__(self, inplanes, planes, stride=1, downsample=None):
         super(BinBasicBlock, self).__init__()
         self.conv1 = binconv3x3(inplanes, planes, stride)
-        #self.bn1 = nn.BatchNorm2d(planes)
+        self.bn1 = nn.BatchNorm2d(planes)
         #self.relu = nn.ReLU(inplace=True)
         self.conv2 = binconv3x3_norelu(planes, planes)
-        #self.bn2 = nn.BatchNorm2d(planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
         self.stride = stride
 
@@ -118,11 +125,11 @@ class BinBasicBlock(nn.Module):
         residual = x
 
         out = self.conv1(x)
-        #out = self.bn1(out)
+        out = self.bn1(out)
         #out = self.relu(out)
 
         out = self.conv2(out)
-        #out = self.bn2(out)
+        out = self.bn2(out)
 
         if self.downsample is not None:
             residual = self.downsample(x)
@@ -141,18 +148,18 @@ class BinBottleneck(nn.Module):
         super(BinBottleneck, self).__init__()
         #self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
         self.conv1 = BinConv2d(inplanes, planes, kernel_size=1, stride=1,
-                               padding=1)
-        #self.bn1 = nn.BatchNorm2d(planes)
+                               padding=0)
+        self.bn1 = nn.BatchNorm2d(planes)
         #self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
         #                       padding=1, bias=False)
         self.conv2 = BinConv2d(planes, planes, kernel_size=3, stride=stride,
                                padding=1)
-        #self.bn2 = nn.BatchNorm2d(planes)
+        self.bn2 = nn.BatchNorm2d(planes)
         #self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
         self.conv3 = BinConv2d_norelu(planes, planes * 4, kernel_size=1, stride=1,
-                               padding=1)
-        #self.bn3 = nn.BatchNorm2d(planes * 4)
-        #self.relu = nn.ReLU(inplace=True)
+                               padding=0)
+        self.bn3 = nn.BatchNorm2d(planes * 4)
+        self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
         self.stride = stride
 
@@ -160,18 +167,19 @@ class BinBottleneck(nn.Module):
         residual = x
 
         out = self.conv1(x)
-        #out = self.bn1(out)
+        out = self.bn1(out)
         #out = self.relu(out)
 
         out = self.conv2(out)
-        #out = self.bn2(out)
+        out = self.bn2(out)
         #out = self.relu(out)
 
         out = self.conv3(out)
-        #out = self.bn3(out)
+        out = self.bn3(out)
 
         if self.downsample is not None:
             residual = self.downsample(x)
+            #print("downsample:out,residual:",out.size(),residual.size())
 
         out += residual
         # TODO: relu?
@@ -213,7 +221,7 @@ class XnorResNet(nn.Module):
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
             downsample = BinConv2d_norelu(self.inplanes, planes * block.expansion,
-                                   kernel_size=1, stride=1, padding=1)
+                                   kernel_size=1, stride=stride, padding=0)
             #downsample = nn.Sequential(
             #    nn.Conv2d(self.inplanes, planes * block.expansion,
             #              kernel_size=1, stride=stride, bias=False),

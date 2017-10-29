@@ -21,6 +21,7 @@ import torchvision.datasets as datasets
 import models.cifar as models
 
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
+import util
 
 
 model_names = sorted(name for name in models.__dict__
@@ -96,8 +97,141 @@ if use_cuda:
 
 best_acc = 0  # best test accuracy
 
-def main():
+def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
+    # switch to train mode
+    model.train()
+
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+    end = time.time()
+
+    bar = Bar('Processing', max=len(trainloader))
+    for batch_idx, (inputs, targets) in enumerate(trainloader):
+        # process the weights including binarization
+        bin_op.binarization()
+
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        if use_cuda:
+            inputs, targets = inputs.cuda(), targets.cuda(async=True)
+        inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
+
+        # compute output
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
+        losses.update(loss.data[0], inputs.size(0))
+        top1.update(prec1[0], inputs.size(0))
+        top5.update(prec5[0], inputs.size(0))
+
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+
+        # restore weights
+        bin_op.restore()
+        bin_op.updateBinaryGradWeight()
+
+        optimizer.step()
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        # plot progress
+        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+                    batch=batch_idx + 1,
+                    size=len(trainloader),
+                    data=data_time.avg,
+                    bt=batch_time.avg,
+                    total=bar.elapsed_td,
+                    eta=bar.eta_td,
+                    loss=losses.avg,
+                    top1=top1.avg,
+                    top5=top5.avg,
+                    )
+        bar.next()
+    bar.finish()
+    return (losses.avg, top1.avg)
+
+def test(testloader, model, criterion, epoch, use_cuda):
     global best_acc
+
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
+    bin_op.binarization()
+
+    end = time.time()
+    bar = Bar('Processing', max=len(testloader))
+    for batch_idx, (inputs, targets) in enumerate(testloader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        if use_cuda:
+            inputs, targets = inputs.cuda(), targets.cuda()
+        inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
+
+        # compute output
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
+        losses.update(loss.data[0], inputs.size(0))
+        top1.update(prec1[0], inputs.size(0))
+        top5.update(prec5[0], inputs.size(0))
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        # plot progress
+        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+                    batch=batch_idx + 1,
+                    size=len(testloader),
+                    data=data_time.avg,
+                    bt=batch_time.avg,
+                    total=bar.elapsed_td,
+                    eta=bar.eta_td,
+                    loss=losses.avg,
+                    top1=top1.avg,
+                    top5=top5.avg,
+                    )
+        bar.next()
+    bin_op.restore()
+    bar.finish()
+    return (losses.avg, top1.avg)
+
+def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar'):
+    filepath = os.path.join(checkpoint, filename)
+    torch.save(state, filepath)
+    if is_best:
+        shutil.copyfile(filepath, os.path.join(checkpoint, 'model_best.pth.tar'))
+
+def adjust_learning_rate(optimizer, epoch):
+    global state
+    if epoch in args.schedule:
+        state['lr'] *= args.gamma
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = state['lr']
+
+
+#def main():
+if __name__=='__main__':
+    #global best_acc
+    best_acc = 0.0
     start_epoch = args.start_epoch  # start from epoch 0 or last checkpoint epoch
 
     if not os.path.isdir(args.checkpoint):
@@ -199,7 +333,11 @@ def main():
         print('\nEvaluation only')
         test_loss, test_acc = test(testloader, model, criterion, start_epoch, use_cuda)
         print(' Test Loss:  %.8f, Test Acc:  %.2f' % (test_loss, test_acc))
-        return
+        exit()
+        #return
+
+    # define the binarization operator
+    bin_op = util.BinOp(model)
 
     # Train and val
     for epoch in range(start_epoch, args.epochs):
@@ -225,131 +363,12 @@ def main():
             }, is_best, checkpoint=args.checkpoint)
 
     logger.close()
-    logger.plot()
+    #logger.plot()
     savefig(os.path.join(args.checkpoint, 'log.eps'))
 
     print('Best acc:')
     print(best_acc)
 
-def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
-    # switch to train mode
-    model.train()
 
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
-    end = time.time()
-
-    bar = Bar('Processing', max=len(trainloader))
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
-        # measure data loading time
-        data_time.update(time.time() - end)
-
-        if use_cuda:
-            inputs, targets = inputs.cuda(), targets.cuda(async=True)
-        inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
-
-        # compute output
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-
-        # measure accuracy and record loss
-        prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
-        losses.update(loss.data[0], inputs.size(0))
-        top1.update(prec1[0], inputs.size(0))
-        top5.update(prec5[0], inputs.size(0))
-
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        # plot progress
-        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
-                    batch=batch_idx + 1,
-                    size=len(trainloader),
-                    data=data_time.avg,
-                    bt=batch_time.avg,
-                    total=bar.elapsed_td,
-                    eta=bar.eta_td,
-                    loss=losses.avg,
-                    top1=top1.avg,
-                    top5=top5.avg,
-                    )
-        bar.next()
-    bar.finish()
-    return (losses.avg, top1.avg)
-
-def test(testloader, model, criterion, epoch, use_cuda):
-    global best_acc
-
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
-
-    # switch to evaluate mode
-    model.eval()
-
-    end = time.time()
-    bar = Bar('Processing', max=len(testloader))
-    for batch_idx, (inputs, targets) in enumerate(testloader):
-        # measure data loading time
-        data_time.update(time.time() - end)
-
-        if use_cuda:
-            inputs, targets = inputs.cuda(), targets.cuda()
-        inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
-
-        # compute output
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-
-        # measure accuracy and record loss
-        prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
-        losses.update(loss.data[0], inputs.size(0))
-        top1.update(prec1[0], inputs.size(0))
-        top5.update(prec5[0], inputs.size(0))
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        # plot progress
-        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
-                    batch=batch_idx + 1,
-                    size=len(testloader),
-                    data=data_time.avg,
-                    bt=batch_time.avg,
-                    total=bar.elapsed_td,
-                    eta=bar.eta_td,
-                    loss=losses.avg,
-                    top1=top1.avg,
-                    top5=top5.avg,
-                    )
-        bar.next()
-    bar.finish()
-    return (losses.avg, top1.avg)
-
-def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar'):
-    filepath = os.path.join(checkpoint, filename)
-    torch.save(state, filepath)
-    if is_best:
-        shutil.copyfile(filepath, os.path.join(checkpoint, 'model_best.pth.tar'))
-
-def adjust_learning_rate(optimizer, epoch):
-    global state
-    if epoch in args.schedule:
-        state['lr'] *= args.gamma
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = state['lr']
-
-if __name__ == '__main__':
-    main()
+#if __name__ == '__main__':
+#    main()
