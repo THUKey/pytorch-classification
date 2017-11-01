@@ -2,6 +2,7 @@
 """
 from .misc import *
 from .logger import *
+from .logboard import *
 from .visualize import *
 from .eval import *
 
